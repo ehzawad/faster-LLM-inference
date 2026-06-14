@@ -1,88 +1,156 @@
-# Super-fast streaming inference for `ehzawad/ec-SFT-qwen25-7b-lora`
+# Fast inference + production deploy — `ehzawad/ec-SFT-qwen25-7b-lora`
 
-Drop-in replacement for the model card's `transformers` + PEFT + `TextIteratorStreamer`
-code, which is single-request, runs the LoRA **unmerged** (extra matmuls every
-token), and has no KV-cache paging or continuous batching.
+Making a **Bengali / Banglish Bangladesh Election-Commission / National-ID assistant**
+(Qwen2.5-7B + a PEFT LoRA) genuinely *fast*, then shipping it as a real public service.
 
-This uses **vLLM** (PagedAttention + continuous batching) with the adapter
-**merged** into the base, **prefix caching**, and **SSE token streaming** over
-the OpenAI-compatible API.
+This README is the full story: what we tried, what the numbers actually said, the decisions we
+made, and how to reproduce/deploy it.
 
-> On **Colab**, use `Stage1_v5_vLLM_Colab.ipynb` instead — it serves *dynamic
-> LoRA* (no 15 GB merge to the throwaway disk) and pins the install to Colab's
-> CUDA driver. The files below are for a **persistent GPU host**.
+---
 
-## Topology (persistent host)
+## TL;DR
 
-- **GPU host** (L4 / L40S / H100 / A100): runs `merge_adapter.py` once, then `serve.sh`.
-- **Local (your Mac)**: runs `chat_stream.py` only — no GPU, no torch.
+- **Model:** `Qwen/Qwen2.5-7B-Instruct` + the public LoRA `ehzawad/ec-SFT-qwen25-7b-lora`, **merged** and run as a single GGUF.
+- **Engine:** **llama.cpp** (`llama-server`) — fastest single-stream path we found.
+- **Live deploy:** **Modal**, scale-to-zero, A100-40GB, `Q5_K_M` GGUF, **greedy (temp 0)**, with an embedded Bengali chat UI.
+- **Single-user speed:** **~95 tok/s** (up from ~25 on the naive `transformers` path).
+- **Cost:** **$0 when idle** (scale-to-zero); `modal app stop` = fully off.
+- **Public URL:** served at `https://<id>.modal.run` (printed by `modal deploy`).
 
-## Quickstart
-
-On the GPU host:
-```bash
-pip install -r requirements-gpu.txt
-python merge_adapter.py                 # downloads adapter + base, merges -> ./ec-qwen25-7b-merged
-bash serve.sh                           # vLLM OpenAI server on :8000  (bf16)
-# L4 (Ada) — faster + frees VRAM for KV:  QUANT=fp8 bash serve.sh
+```
+                  Modal (scale-to-zero, A100)
+ user ──https──▶ FastAPI chat page  ──localhost──▶ llama-server (Q5_K_M GGUF, --flash-attn on)
+                 (injects trained system prompt, temp 0)
 ```
 
-Locally:
+---
+
+## The journey — what we tried (and what each taught us)
+
+| Attempt | Result | Lesson |
+|---|---|---|
+| **vLLM on Colab** | ❌ failed | Free T4 (16 GB) can't hold 7B bf16; the server pattern adds a "Connection refused" failure class on Colab. |
+| **`transformers` + PEFT (model card code)** | slow, single-request | Runs the LoRA *unmerged* (extra matmuls/token), no paging/batching, Python-thread streaming. |
+| **Unsloth (in-process, 4-bit→bf16)** | ✅ ~25 tok/s on A100 | In-process kills the server problem; but HF `generate()` + `TextStreamer` has per-token Python overhead that caps an A100 far below its potential. |
+| **llama.cpp GGUF (in-process / `llama-server`)** | ✅ **~100 tok/s solo** | C++ decode loop, no per-token Python, paged KV, real continuous batching. **Winner.** |
+| **Modal (production)** | ✅ live, scale-to-zero | Public URL, $0 idle, 30-concurrent capable, one-line quant swaps. |
+
+> Colab note: Colab ships **Python 3.12 + torch 2.8**, but the latest vLLM/llama-cpp wheels pin other
+> torch/CUDA versions — naive `pip install` reinstalls torch and breaks CUDA. The fix is matching the
+> wheel to the driver (`uv ... --torch-backend=auto`, or llama-cpp-python's `--index-url .../whl/cu124`).
+
+---
+
+## Key findings (the empirical data)
+
+All measured on a single **A100-40GB**, greedy (temp 0), real Bengali EC/NID prompts.
+
+### 1. Quantization: speed vs quality (single-user)
+
+| Quant | Solo tok/s | Size | Quality (vs Q8_0, temp 0) |
+|---|---:|---:|---|
+| Q8_0 | 82 | 8.1 GB | near-lossless (reference) |
+| Q6_K | ~95–100 | 6.3 GB | near-lossless |
+| **Q5_K_M (live)** | **~93–110** | 5.4 GB | byte-identical on tested facts |
+| Q4_K_M | 101 | 4.7 GB | byte-identical on tested facts |
+
+- **At temp 0, Q4/Q5/Q8 produced *byte-identical* Bengali answers** on the fee / document-list / smart-card prompts — quantization didn't flip a single token on high-confidence facts.
+- **~130 tok/s is *not* reachable on an A100** (Q4 caps ~101; the k-quant dequant overhead eats the bandwidth saving). 130+ needs an H100.
+- **Chosen: `Q5_K_M`** — the speed sweet spot with negligible quality risk. Q4's extra ~8% (~0.2 s/answer) isn't worth being the lossiest quant for a recall-sensitive bot.
+
+### 2. Concurrency: the regime flips the winner
+
+| Config | Q8_0 | Q5_K_M |
+|---|---:|---:|
+| Solo (1 user) | 82 tok/s | ~110 tok/s |
+| **30 concurrent — aggregate** | **414 tok/s** | 273 tok/s |
+| 30 concurrent — per user | ~14 tok/s | ~9 tok/s |
+| Peak VRAM | 21.3 GB (52%) | 18.9 GB (46%) |
+
+- **Solo is memory-bandwidth-bound** → smaller quant (Q5) wins.
+- **Heavy batching is compute-bound** → Q8's cheaper dequant wins; per-user speed is a *batching* effect, not a quant one.
+- **30/30 concurrent succeeded** on one A100 using **52% of VRAM** — huge headroom.
+
+### 3. Things that *don't* make it faster (myths busted)
+
+- **Bigger KV cache ≠ faster.** It's a *capacity* lever (longer context / more concurrency). Decode is bandwidth-bound; a bigger cache only *adds* read traffic per token.
+- **Free VRAM ≠ faster.** ~20 GB sat idle at 30-concurrent; it can't be converted into tok/s.
+- **Speculative decoding** (Qwen2.5-0.5B draft): measured **0.65× — 35% *slower***. A generic draft has low acceptance on the fine-tuned Bengali style, so verification overhead exceeds the savings. *Lossless* at temp 0, but useless here. Discarded.
+
+### 4. The real levers
+
+- **Engine** (`transformers` → llama.cpp): the biggest win (~4×).
+- **Quant** (Q8 → Q5): ~+15–34% solo.
+- **`--parallel`** (not KV/quant) for "per-user feels slow under load" — trades max concurrency for active-stream speed.
+- **temperature 0** (greedy): most deterministic / most factual — correct for a recall-sensitive bot.
+
+---
+
+## Deploy it yourself (Modal — the live path)
+
+Everything is in [`deploy/modal_app.py`](deploy/modal_app.py). One image, scale-to-zero, public URL.
+
 ```bash
-pip install -r requirements-client.txt
-BASE_URL=http://<gpu-host>:8000/v1 python chat_stream.py
+python3 -m venv .venv && .venv/bin/pip install modal
+.venv/bin/modal token new                                   # one-time Modal auth
+
+# 1) build the GGUF once (merges the public LoRA on an A100, quantizes onto a Volume)
+.venv/bin/modal run   deploy/modal_app.py::build_gguf
+
+# 2) deploy the public chat service  ->  prints https://<id>.modal.run
+.venv/bin/modal deploy deploy/modal_app.py
 ```
 
-## Your two GPUs (reconciled with a Codex council review)
+Control & cost:
+```bash
+.venv/bin/modal app stop ec-nid-chat     # COMPLETELY off -> $0 (redeploy to turn back on)
+```
+- **Idle = $0** (scale-to-zero after 120 s); you pay per active GPU-second only.
+- A100-40GB ≈ $2.10/hr *while serving*; first request after idle cold-starts ~30–60 s.
 
-| GPU  | Arch   | Weights        | "Larger KV" lever                  | Command                                              |
-|------|--------|----------------|------------------------------------|------------------------------------------------------|
-| L4   | Ada    | bf16 *or* FP8  | FP8 weights free ~7 GB **+** FP8 KV | `QUANT=fp8 bash serve.sh`, add `KV_CACHE_DTYPE=fp8`   |
-| A100 | Ampere | bf16 only      | raw VRAM (40/80 GB) **+** FP8 KV    | `bash serve.sh`, raise `MAX_LEN`, add `KV_CACHE_DTYPE=fp8` |
+Built-in test/benchmark functions:
+```bash
+.venv/bin/modal run deploy/modal_app.py::loadtest        # 30-concurrent throughput + VRAM
+.venv/bin/modal run deploy/modal_app.py::compare_quants  # Q4/Q5/Q8 side-by-side speed + Bengali answers
+.venv/bin/modal run deploy/modal_app.py::spectest        # speculative-decoding A/B (it loses; kept for evidence)
+```
 
-**Two FP8 knobs that are NOT the same flag** (this was a real bug in the first draft):
-- `QUANT=fp8` → quantizes **weights/activations**. Ada/Hopper only for a real
-  speedup (A100 runs FP8 weight-only via Marlin = no compute win). Prefer
-  `QUANT=fp8_per_block` if your vLLM supports it (more robust to outlier tensors
-  for this Bengali adapter); plain `fp8` is the safe fallback.
-- `KV_CACHE_DTYPE=fp8` → quantizes the **KV cache** (`--kv-cache-dtype fp8`).
-  This is the actual "larger KV / longer context" lever: ~2× KV capacity, and it
-  works on **both** L4 and A100. `QUANT=fp8` does **not** turn this on.
+### How it works
+- **`build_gguf`** (A100): downloads the public base + LoRA, merges on GPU, converts to GGUF, k-quantizes, saves to a Modal **Volume** (persists across runs). The trained tokenizer/chat-template + `system_prompt.txt` are carried so prompts render exactly as in training.
+- **`Server`** (`@app.cls`, scale-to-zero): on cold start launches `llama-server` on localhost (`--flash-attn on`, full GPU offload), then a FastAPI app serves the chat page at `/` and proxies `/chat` (injecting the system prompt) with SSE streaming. Hardened: input validation, per-IP rate limit, in-flight lock, upstream error handling, llama-server liveness check, prominent NID disclaimer.
 
-**Fidelity caveat (this is a recall-sensitive EC/NID model):** FP8 is not free.
-Treat both FP8 weights and especially **uncalibrated FP8 KV** as something to A/B
-against bf16 on a small Bengali/Banglish eval before trusting in production — KV
-quantization error shows up most in long-context exact recall (dates, NID digits,
-form numbers, fees). Keep the bf16 merged checkpoint as your reference.
+> CUDA gotcha solved here: Modal builds images **without a GPU**, so compiling llama.cpp with CUDA needs the
+> toolkit's **stub `libcuda`** at link time (the real driver is present at runtime). `torch` is pinned to
+> `cu124` to match the CUDA 12.4 image. Also note `--flash-attn` now takes a value (`on`), not a bare flag.
 
-## KV-cache math (Qwen2.5-7B, so you can size batches)
+---
 
-`28 layers × (K+V) × 4 kv-heads × 128 head-dim × 2 B = 56 KiB / token` (bf16).
-- One full 8192-token sequence ≈ **0.44 GiB** bf16, **0.22 GiB** FP8 KV.
-- 16384 ctx ≈ 0.875 GiB; 32768 ctx ≈ 1.75 GiB per sequence.
-- After ~15 GB of bf16 weights, L4 (24 GB) has only a few GiB for KV → FP8
-  weights and/or FP8 KV are what buy you real batch size there. A100 has plenty.
+## Other deploy paths
 
-## Context length
+- **Persistent GPU VM** — [`deploy/docker-compose.yml`](deploy/docker-compose.yml): `llama-server` (private) + **Open WebUI** (public) + **Caddy** (TLS). See [`deploy/README.md`](deploy/README.md).
+- **RunPod Pod** — [`deploy/RUNPOD.md`](deploy/RUNPOD.md) + [`deploy/runpod-entrypoint.sh`](deploy/runpod-entrypoint.sh): build-on-pod from the public adapter, network-volume cached.
+- **Standalone GPU host** (no Docker) — `merge_adapter.py` → `serve.sh` (vLLM) → `chat_stream.py` (streaming client). The original `transformers`/PEFT path this project replaced.
 
-`MAX_LEN` is a *cap*, not the source of KV size (KV is governed by free VRAM ×
-`--gpu-memory-utilization` × `--kv-cache-dtype`). Qwen2.5-7B is native 32768, so
-raising `MAX_LEN` up to 32768 on the A100 needs **no** RoPE/YaRN change. Beyond
-32768 you'd add YaRN via `--hf-overrides`. The adapter trained at 8192, so treat
-longer context as something to eval, not a free win.
+---
 
-## Speed knobs (in `serve.sh`)
+## Production caveats (honest notes)
 
-- `--enable-prefix-caching` — on by default in current vLLM; kept for clarity.
-  The repo's `system_prompt.txt` is ~1300 tokens, so caching that shared prefix
-  across requests is a real win. (If your deployment overrides it with a
-  one-liner, the benefit shifts to repeated multi-turn history instead.)
-- `QUANT` / `KV_CACHE_DTYPE` — see the FP8 table above.
-- speculative decoding (commented example) — single-stream latency.
+- **The real fidelity lever is retrieval, not the quant.** For exact, time-sensitive facts (fees, deadlines), pair the model with retrieval over official sources (`services.nidw.gov.bd`) rather than trusting static weights — the model card says the same. Q-level only affects whether the *recalled* answer drifts; it doesn't make stale facts current.
+- **Before trusting a lighter quant (e.g. Q4) in production**, run a ~50–120 prompt Bengali/Banglish A/B (rare fees, corrections, Banglish spellings, numerals, adversarial "are you sure?") graded against source truth — not just byte-match on common prompts.
+- **Security for a public gov bot:** keep inference private (only the frontend public), add per-IP rate limiting (Cloudflare/WAF), don't log raw prompts (users paste NID numbers), and keep the disclaimer prominent.
+- Methodology and quant/deploy decisions were cross-checked with a multi-agent review at each step.
 
-## Files
+---
 
-- `Stage1_v5_vLLM_Colab.ipynb` — **Colab** path: dynamic LoRA, driver-matched install, streaming.
-- `merge_adapter.py` — fold LoRA into base, write vLLM-ready checkpoint + tokenizer + system prompt.
-- `serve.sh` — vLLM launch; Option A = merged (default, fastest), Option B = dynamic LoRA (`SERVE_MODE=lora`).
-- `chat_stream.py` — local streaming client; injects system prompt, trims history, prints TTFT + tok/s.
+## Repo layout
+
+```
+deploy/
+  modal_app.py          # LIVE: Modal scale-to-zero llama.cpp service + chat UI + test fns
+  docker-compose.yml    # persistent GPU-VM stack (llama-server + Open WebUI + Caddy)
+  Caddyfile  .env.example  README.md  RUNPOD.md  runpod-entrypoint.sh
+merge_adapter.py        # merge LoRA -> vLLM-ready checkpoint (standalone host path)
+serve.sh                # vLLM OpenAI server (standalone host path)
+chat_stream.py          # local streaming client
+requirements-*.txt
+```
