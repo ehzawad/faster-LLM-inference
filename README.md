@@ -12,14 +12,14 @@ made, and how to reproduce/deploy it.
 
 - **Model:** `Qwen/Qwen2.5-7B-Instruct` + the public LoRA `ehzawad/ec-SFT-qwen25-7b-lora`, **merged** and run as a single GGUF.
 - **Engine:** **llama.cpp** (`llama-server`) — fastest single-stream path we found.
-- **Live deploy:** **Modal**, scale-to-zero, A100-40GB, `Q5_K_M` GGUF, **greedy (temp 0)**, with an embedded Bengali chat UI.
-- **Single-user speed:** **~95 tok/s** (up from ~25 on the naive `transformers` path).
+- **Live deploy:** **Modal**, scale-to-zero, A100-40GB, `Q8_0` GGUF, **greedy (temp 0)**, embedded Bengali chat UI + multi-turn follow-up handling.
+- **Single-user speed:** **~82 tok/s** at Q8_0 — a Bengali answer streams in ~2–3 s (up from ~25 on the naive `transformers` path).
 - **Cost:** **$0 when idle** (scale-to-zero); `modal app stop` = fully off.
 - **Public URL:** served at `https://<id>.modal.run` (printed by `modal deploy`).
 
 ```
                   Modal (scale-to-zero, A100)
- user ──https──▶ FastAPI chat page  ──localhost──▶ llama-server (Q5_K_M GGUF, --flash-attn on)
+ user ──https──▶ FastAPI chat page  ──localhost──▶ llama-server (Q8_0 GGUF, --flash-attn on)
                  (injects trained system prompt, temp 0)
 ```
 
@@ -49,14 +49,15 @@ All measured on a single **A100-40GB**, greedy (temp 0), real Bengali EC/NID pro
 
 | Quant | Solo tok/s | Size | Quality (vs Q8_0, temp 0) |
 |---|---:|---:|---|
-| Q8_0 | 82 | 8.1 GB | near-lossless (reference) |
+| **Q8_0 (live)** | 82 | 8.1 GB | near-lossless — the chosen production quant |
 | Q6_K | ~95–100 | 6.3 GB | near-lossless |
-| **Q5_K_M (live)** | **~93–110** | 5.4 GB | byte-identical on tested facts |
-| Q4_K_M | 101 | 4.7 GB | byte-identical on tested facts |
+| Q5_K_M | ~93–110 | 5.4 GB | identical on common facts; **drifts on some** |
+| Q4_K_M | 101 | 4.7 GB | identical on common facts; **drifts on some** |
 
-- **At temp 0, Q4/Q5/Q8 produced *byte-identical* Bengali answers** on the fee / document-list / smart-card prompts — quantization didn't flip a single token on high-confidence facts.
-- **~130 tok/s is *not* reachable on an A100** (Q4 caps ~101; the k-quant dequant overhead eats the bandwidth saving). 130+ needs an H100.
-- **Chosen: `Q5_K_M`** — the speed sweet spot with negligible quality risk. Q4's extra ~8% (~0.2 s/answer) isn't worth being the lossiest quant for a recall-sensitive bot.
+- **On common high-confidence prompts (fee / document-list / smart-card), Q4/Q5/Q8 were *byte-identical* at temp 0** — quantization didn't flip a token.
+- **But a multi-turn replay exposed real drift:** on a low-margin EC/NID fact (the NID *reissue* answer), **Q5/Q4 diverged from Q8** — Q8 gave the specific procedure ("no GD; pay the set fee online with the NID number"), Q5/Q4 a vaguer "apply via the portal." So the lighter quants *do* lose fidelity on harder facts.
+- **~130 tok/s is *not* reachable on an A100** (Q4 caps ~101; k-quant dequant overhead eats the bandwidth saving). 130+ needs an H100.
+- **Chosen: `Q8_0`** — for a recall-sensitive government bot, fidelity beats the ~0.2 s/answer the lighter quants save. 82 tok/s still streams an answer in ~2–3 s. (Q5/Q4 stay on the Volume for A/B.)
 
 ### 2. Concurrency: the regime flips the winner
 
@@ -83,6 +84,12 @@ All measured on a single **A100-40GB**, greedy (temp 0), real Bengali EC/NID pro
 - **Quant** (Q8 → Q5): ~+15–34% solo.
 - **`--parallel`** (not KV/quant) for "per-user feels slow under load" — trades max concurrency for active-stream speed.
 - **temperature 0** (greedy): most deterministic / most factual — correct for a recall-sensitive bot.
+
+### 5. Multi-turn context handling
+
+- Bengali follow-up **fragments** like "কতদিন লাগে" (how many days?) have no subject — the model resolves them from the **conversation history**. Verified by cURL: the *same* fragment after a *registration* context → "৩০ কার্যদিবস" (30 working days), after a *smart-card* context → "no fixed timeline." Same question, different context, both correct.
+- So a follow-up giving "different" answers across sessions is **correct context resolution, not a bug** — at temp 0 it's deterministic for a fixed history.
+- `/chat` does **token-budget history trimming**: it always keeps the trained system prompt + the **most-recent turns** (Bengali ≈ 1 token/char) within the 8k window, so long chats can't silently overflow and drop context.
 
 ---
 
