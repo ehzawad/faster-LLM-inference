@@ -1,0 +1,7 @@
+# GPU host (the machine that runs vLLM + the merge step). CUDA only.
+# Pin vLLM to a recent release; it pulls a matching torch.
+vllm>=0.8.0
+transformers>=4.49.0
+peft>=0.13.0
+accelerate>=1.0.0
+huggingface_hub>=0.25.0

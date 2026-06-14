@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local secrets & config — never commit real ones (the templates *.example are fine)
+.env
+.env.local
+deploy/.env
+.modal.toml
+
+# Model weights / artifacts — huge; they live on the Modal Volume / HF Hub, not in git
+*.gguf
+*.safetensors
+*.bin
+ec-qwen25-7b-merged/
+merged/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

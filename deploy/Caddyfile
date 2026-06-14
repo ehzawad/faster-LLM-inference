@@ -1,0 +1,22 @@
+# Only the chat frontend is public. Caddy auto-provisions + renews TLS for {$DOMAIN}
+# (the host must be reachable on 80/443 and DNS must already point here).
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Sensible limits for a public citizen-facing chat
+	request_body {
+		max_size 64KB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	reverse_proxy open-webui:8080
+}
+
+# NOTE: the inference server (llama) is deliberately NOT proxied here — it stays private on the
+# Docker network. Do not add a public route to it. For per-IP rate limiting, put Cloudflare /
+# a WAF in front of this host, or build Caddy with the rate-limit plugin.

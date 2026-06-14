@@ -1,0 +1,120 @@
+# Product-grade PILOT stack for the EC/NID Qwen2.5-7B assistant.
+#
+#   Internet ──▶ Caddy (TLS, public 80/443) ──▶ Open WebUI (chat panel)
+#                                                     └──▶ llama-server (inference, PRIVATE — no host port)
+#
+# Why this shape (Codex-council reconciled): never put the inference server or a raw model UI on the
+# public internet. Only the frontend is public; inference stays on the internal Docker network behind auth.
+#
+# Host prereqs for a normal GPU VM. RunPod Pods are single-container runtimes, so this
+# compose file is a reference stack there, not something to run directly inside a Pod.
+#   - Docker + NVIDIA Container Toolkit (so containers see the GPU; test: `docker run --rm --gpus all ubuntu nvidia-smi`)
+#   - Docker Compose v2.30+ (for the `gpus:` key; otherwise use the deploy.resources block noted below)
+#   - A GPU (A100 40/80GB for ~30 concurrent 8k slots), DNS A-record DOMAIN -> this host, ports 80/443 open
+#   - Put the Q6_K GGUF at:  /srv/ec-nid/models/ec-qwen25-7b.Q6_K.gguf
+#     For RunPod-first delivery, build it once on a network volume with runpod-entrypoint.sh
+#     instead of transferring the Colab-only artifact through the user's Mac.
+#
+# Then:  cp .env.example .env  &&  edit .env  &&  docker compose up -d
+
+services:
+  # ---- Inference (PRIVATE: no `ports:`, only reachable on the internal network) ----
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    restart: unless-stopped
+    gpus: all                       # Compose <2.30: replace with the deploy.resources block at the bottom
+    expose: ["8000"]                # internal only
+    volumes:
+      - /srv/ec-nid/models:/models:ro
+    # --parallel = concurrent generation slots. With explicit slots, reserve the full context budget:
+    # 32 slots x 8192 ctx = 262144 total ctx ~= 14GB KV + ~6GB weights ~= 20GB before overhead.
+    # On an L4 (24GB) drop to --parallel 8-12 or use --ctx-size 32768-65536. --cont-batching
+    # interleaves the slots so they share the GPU efficiently.
+    command: >
+      -m /models/ec-qwen25-7b.Q6_K.gguf
+      --alias ec-nid-qwen25-7b
+      --host 0.0.0.0 --port 8000
+      --ctx-size 262144
+      --n-gpu-layers 999
+      --flash-attn
+      --parallel 32
+      --cont-batching
+      --api-key ${INFERENCE_API_KEY}
+    networks: [ecnid]
+
+  # ---- Chat panel (public via Caddy only) ----
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    restart: unless-stopped
+    depends_on: [llama]
+    environment:
+      OPENAI_API_BASE_URL: http://llama:8000/v1
+      OPENAI_API_KEY: ${INFERENCE_API_KEY}
+      DEFAULT_MODELS: ec-nid-qwen25-7b
+      WEBUI_NAME: ${WEBUI_NAME}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_AUTH: "true"            # require login
+      ENABLE_SIGNUP: "false"        # admins create accounts; no open signup
+      DEFAULT_USER_ROLE: "pending"
+      ENABLE_OPENAI_API: "true"
+      WEBUI_BANNERS: ${WEBUI_BANNERS}
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":512,"temperature":0.2,"top_p":0.9}'
+      USER_PERMISSIONS_CHAT_FILE_UPLOAD: "false"
+      USER_PERMISSIONS_CHAT_WEB_UPLOAD: "false"
+      USER_PERMISSIONS_CHAT_SYSTEM_PROMPT: "false"
+      USER_PERMISSIONS_CHAT_PARAMS: "false"
+    volumes:
+      - /srv/ec-nid/open-webui:/app/backend/data   # NOTE: stores chat history -> see README PII warning
+    expose: ["8080"]
+    networks: [ecnid]
+
+  # ---- Edge: TLS + reverse proxy (the only public service) ----
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [open-webui]
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [ecnid]
+
+networks:
+  ecnid:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+# ---- PRODUCTION (higher sustained concurrency): swap to vLLM serving the MERGED bf16 model ----
+# llama-server is acceptable for the first ~30-user public pilot if shared throughput is acceptable.
+# Move to vLLM when sustained active generations push p95 user speed/TTFT below target. Put the merged
+# HF dir at /srv/ec-nid/models/ec-qwen25-7b-merged, then use:
+#
+#   vllm:
+#     image: vllm/vllm-openai:latest
+#     restart: unless-stopped
+#     gpus: all
+#     ipc: host
+#     expose: ["8000"]
+#     volumes: [/srv/ec-nid/models:/models:ro]
+#     command: >
+#       --model /models/ec-qwen25-7b-merged
+#       --served-model-name ec-nid-qwen25-7b
+#       --host 0.0.0.0 --port 8000
+#       --dtype bfloat16 --max-model-len 8192
+#       --gpu-memory-utilization 0.86 --max-num-seqs 16 --max-num-batched-tokens 16384
+#       --enable-prefix-caching --generation-config vllm
+#       --api-key ${INFERENCE_API_KEY}
+#       --no-enable-log-requests --disable-uvicorn-access-log --disable-fastapi-docs
+#   # then point open-webui OPENAI_API_BASE_URL at http://vllm:8000/v1
+#
+# ---- Compose < 2.30 GPU syntax (replace `gpus: all` with): ----
+#   deploy:
+#     resources:
+#       reservations:
+#         devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
