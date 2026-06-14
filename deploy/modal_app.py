@@ -20,10 +20,11 @@ APP_NAME = "ec-nid-chat"
 ADAPTER = "ehzawad/ec-SFT-qwen25-7b-lora"   # public LoRA
 BASE = "Qwen/Qwen2.5-7B-Instruct"           # public base
 VOL_DIR = "/models"
-# Decision: SINGLE-USER speed is the priority (concurrency not a concern; quant is a 1-line swap in prod).
-# Q5_K_M = 110 tok/s solo (+34% over Q8's 82 tok/s), slightly lossy but acceptable. Q4_K_M (~125-130) is the
-# next step up in speed at higher quality risk. bf16 master + all quants kept on the Volume to switch fast.
-QUANT = "Q5_K_M"
+# Decision (final): Q8_0 for MAX FACTUAL FIDELITY. A multi-turn replay showed Q5_K_M / Q4_K_M drift from Q8
+# on a low-margin EC/NID fact (the reissue answer) — for a recall-sensitive gov bot, fidelity > the ~0.2s/answer
+# speed edge of the lighter quants. Q8_0 ≈ 82 tok/s solo (answers still stream in ~2-3 s). Other quants stay on
+# the Volume for A/B. (Concurrency isn't a concern; quant is a 1-line swap.)
+QUANT = "Q8_0"
 GGUF = f"{VOL_DIR}/ec-qwen25-7b.{QUANT}.gguf"
 LLAMA_PORT = 8080
 
@@ -233,6 +234,68 @@ def loadtest(n: int = 30, max_tokens: int = 256, gguf: str = GGUF):
             "p50_s": round(pct(.5), 1), "p95_s": round(pct(.95), 1),
             "agg_tok_s": round(toks / wall, 1) if wall else 0,
             "mem_load_mib": base_used, "mem_peak_mib": peak["used"], "mem_total_mib": total}
+
+
+# ---------------- MULTI-TURN CONTEXT TEST: is a differing answer quant or context? ----------------
+@app.function(image=image, gpu="A100-40GB", volumes={VOL_DIR: models}, timeout=60 * 25)
+def ctx_compare(quants: str = "Q8_0,Q5_K_M,Q4_K_M", max_tokens: int = 220):
+    """Replay the SAME multi-turn conversation on each quant (greedy temp 0) and print every answer,
+    so we can see whether a differing reply is from QUANT precision or from CONVERSATION CONTEXT.
+    Run: modal run deploy/modal_app.py::ctx_compare"""
+    import asyncio
+    from pathlib import Path
+    import httpx
+
+    sp = Path(f"{VOL_DIR}/system_prompt.txt")
+    system = sp.read_text("utf-8").strip() if sp.exists() else ""
+    USER_TURNS = [
+        "স্মার্ট কার্ড হারিয়ে গেলে কী করনীয়,নতুন কার্ড কীভাবে পাবো?",
+        "এনআইডি নষ্ট হয়ে গেছে,পুনঃইস্যু করা যাবে?",
+        "নতুন NID কার্ড  কত টাকা লাগে",
+        "কি কি ডকুমেন্ট লাগে",
+        "কতদিন লাগে",
+    ]
+    out = {}
+    for q in [x.strip() for x in quants.split(",") if x.strip()]:
+        g = f"{VOL_DIR}/ec-qwen25-7b.{q}.gguf"
+        if not Path(g).exists():
+            print(f"[{q}] GGUF not on Volume — skipping")
+            continue
+        proc = subprocess.Popen(llama_cmd(g))
+        try:
+            wait_for_health(proc)
+        except Exception as e:
+            print(f"[{q}] llama-server failed: {e}")
+            continue
+
+        history = []
+
+        async def ask(user):
+            msgs = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user}]
+            payload = {"model": "ec", "stream": False, "temperature": 0.0, "top_p": 1.0,
+                       "max_tokens": max_tokens, "messages": msgs}
+            async with httpx.AsyncClient(timeout=300) as c:
+                r = await c.post(f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions", json=payload)
+            return r.json()["choices"][0]["message"]["content"].strip()
+
+        answers = []
+        for u in USER_TURNS:
+            a = asyncio.run(ask(u))
+            history += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
+            answers.append(a)
+        out[q] = answers
+        try: proc.terminate()
+        except Exception: pass
+        time.sleep(3)
+
+    print("\n========= MULTI-TURN CONTEXT TEST (same convo, greedy temp 0) =========")
+    for i, u in enumerate(USER_TURNS):
+        print(f"\nUSER: {u}")
+        for q in out:
+            print(f"  [{q}] {out[q][i]}")
+    print("\n(If all quants agree per turn -> differences are CONTEXT, not precision.)")
+    print("======================================================================\n")
+    return out
 
 
 # ---------------- QUANT COMPARE: quality (answers) + solo speed across quants ----------------
@@ -513,6 +576,12 @@ class Server:
                     msgs.append({"role": role, "content": content[:MAX_MSG_CHARS]})
             if not msgs or msgs[-1]["role"] != "user":
                 return JSONResponse({"error": "last message must be from user"}, status_code=422)
+
+            # Token-budget trim (Bengali ≈ 1 token/char): always keep the system prompt + the MOST RECENT
+            # turns (which carry follow-up context like "কতদিন লাগে") + the current question, within 8k.
+            budget = 8192 - 512 - len(SYS)          # ctx - output reservation - system prompt
+            while len(msgs) > 1 and sum(len(m["content"]) for m in msgs) > budget:
+                msgs = msgs[2:]                     # drop the oldest user+assistant pair
 
             payload = {"model": "ec-nid",
                        "messages": [{"role": "system", "content": SYS}] + msgs,
