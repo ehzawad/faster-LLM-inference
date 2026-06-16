@@ -195,6 +195,54 @@ Built-in test/benchmark functions:
 
 ---
 
+## How Q4_K_M was built & why it's fast (llama.cpp internals)
+
+### The build (3 steps, in `build_gguf`)
+```
+ LoRA adapter + base                merge_and_unload (GPU, bf16)
+ (Hugging Face)        ──────────▶  one merged Qwen2.5-7B (HF, ~15 GB)
+                                            │
+                       convert_hf_to_gguf.py │  (lossless)
+                                            ▼
+                                   bf16 GGUF (~15 GB, the "master")
+                                            │
+                       llama-quantize ... Q4_K_M
+                                            ▼
+                                   Q4_K_M GGUF (~4.7 GB)  ← live
+```
+You never quantize the LoRA directly — merge it into the base first, make one **lossless bf16 GGUF**, then `llama-quantize` compresses *that*. (You can't go Q8→Q4 well; always quantize from a high-precision source.)
+
+### What llama.cpp is
+- A **C/C++ inference engine** — no Python/PyTorch at runtime → low overhead, fast single-stream, runs CPU/CUDA/Metal.
+- Built on **`ggml`** (a minimal tensor library: data types, ops, GPU/CPU backends).
+- Models are **`GGUF`** files: quantized weights **+ all metadata** (architecture, tokenizer, **chat template**, hyperparameters) in one self-contained, memory-mappable file — that's why the converted GGUF already knows how to format Bengali ChatML.
+- `llama-server` = the OpenAI-compatible HTTP server on top (what the Modal container runs).
+
+### What "Q4_K_M" actually is
+Weights are stored in **blocks with shared scales**, not one number each. Q4_K uses a **k-quant super-block**:
+```
+ super-block = 256 weights
+ ├── split into 8 sub-blocks of 32
+ ├── each weight  → 4 bits (integer 0–15)
+ ├── each sub-block → 6-bit scale + 6-bit min   (w ≈ scale·q + min)
+ └── those scales/mins → quantized vs 1 fp16 super-block scale + min
+```
+The hierarchical scales are the trick — spending a few bits on *good* scales buys far more accuracy than naive 4-bit. Effective ≈ **~4.8 bits/weight**.
+
+**The `_M` ("Medium") is a *mix*, not one format:** mostly Q4_K (4-bit), but the **sensitive tensors** (attention *value* + FFN *down* projections, output layer) are bumped to **Q6_K (6-bit)** because they hurt quality most when crushed. So `Q4_K_M` (~4.7 GB) beats `Q4_K_S` (all 4-bit) and is smaller/faster than Q5/Q6/Q8. Ladder: `Q2_K < Q3_K < Q4_K_S < Q4_K_M < Q5_K_M < Q6_K < Q8_0 < bf16`.
+
+> Optional accuracy booster (not used here): an **imatrix** (importance matrix from sample text) tells the quantizer which weights matter most.
+
+### Why it's faster
+Decoding is **memory-bandwidth-bound** — every token re-reads *all* the weights:
+```
+ Q8_0:   ~8.0 GB/token →  82 tok/s
+ Q4_K_M: ~4.7 GB/token → 101 tok/s   (less data to move = faster)
+```
+The 4-bit blocks are **dequantized on-the-fly inside the matmul kernel** (fused). That dequant costs *some* compute, so Q4 isn't a clean 8/4.7 = 1.7× — you get ~1.23×. The trade: ~4.8 bits vs 16 means *rare, low-confidence* facts can occasionally drift (the reissue answer), while common high-confidence facts stay byte-identical.
+
+---
+
 ## Production caveats (honest notes)
 
 - **The real fidelity lever is retrieval, not the quant.** For exact, time-sensitive facts (fees, deadlines), pair the model with retrieval over official sources (`services.nidw.gov.bd`) rather than trusting static weights — the model card says the same. Q-level only affects whether the *recalled* answer drifts; it doesn't make stale facts current.
