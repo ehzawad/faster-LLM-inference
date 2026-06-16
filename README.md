@@ -12,14 +12,14 @@ made, and how to reproduce/deploy it.
 
 - **Model:** `Qwen/Qwen2.5-7B-Instruct` + the public LoRA `ehzawad/ec-SFT-qwen25-7b-lora`, **merged** and run as a single GGUF.
 - **Engine:** **llama.cpp** (`llama-server`) — fastest single-stream path we found.
-- **Live deploy:** **Modal**, scale-to-zero, A100-40GB, `Q8_0` GGUF, **greedy (temp 0)**, embedded Bengali chat UI + multi-turn follow-up handling.
-- **Single-user speed:** **~82 tok/s** at Q8_0 — a Bengali answer streams in ~2–3 s (up from ~25 on the naive `transformers` path).
+- **Live deploy:** **Modal**, scale-to-zero, A100-40GB, `Q4_K_M` GGUF (speed-priority), **greedy (temp 0)**, embedded Bengali chat UI + multi-turn follow-up handling.
+- **Single-user speed:** **~101 tok/s** at Q4_K_M (up from ~25 on the naive `transformers` path). Swap to `Q8_0` for verbatim fidelity at ~82 tok/s — a 1-line change.
 - **Cost:** **$0 when idle** (scale-to-zero); `modal app stop` = fully off.
 - **Public URL:** served at `https://<id>.modal.run` (printed by `modal deploy`).
 
 ```
                   Modal (scale-to-zero, A100)
- user ──https──▶ FastAPI chat page  ──localhost──▶ llama-server (Q8_0 GGUF, --flash-attn on)
+ user ──https──▶ FastAPI chat page  ──localhost──▶ llama-server (Q4_K_M GGUF, --flash-attn on)
                  (injects trained system prompt, temp 0)
 ```
 
@@ -49,15 +49,15 @@ All measured on a single **A100-40GB**, greedy (temp 0), real Bengali EC/NID pro
 
 | Quant | Solo tok/s | Size | Quality (vs Q8_0, temp 0) |
 |---|---:|---:|---|
-| **Q8_0 (live)** | 82 | 8.1 GB | near-lossless — the chosen production quant |
+| **Q4_K_M (live)** | **101** | 4.7 GB | identical on common facts; small drift on rare ones |
 | Q6_K | ~95–100 | 6.3 GB | near-lossless |
-| Q5_K_M | ~93–110 | 5.4 GB | identical on common facts; **drifts on some** |
-| Q4_K_M | 101 | 4.7 GB | identical on common facts; **drifts on some** |
+| Q5_K_M | ~94 | 5.4 GB | identical on common facts; small drift on rare ones |
+| Q8_0 | 82 | 8.1 GB | near-lossless (verbatim) — swap to this for max fidelity |
 
 - **On common high-confidence prompts (fee / document-list / smart-card), Q4/Q5/Q8 were *byte-identical* at temp 0** — quantization didn't flip a token.
 - **But a multi-turn replay exposed real drift:** on a low-margin EC/NID fact (the NID *reissue* answer), **Q5/Q4 diverged from Q8** — Q8 gave the specific procedure ("no GD; pay the set fee online with the NID number"), Q5/Q4 a vaguer "apply via the portal." So the lighter quants *do* lose fidelity on harder facts.
 - **~130 tok/s is *not* reachable on an A100** (Q4 caps ~101; k-quant dequant overhead eats the bandwidth saving). 130+ needs an H100.
-- **Chosen: `Q8_0`** — for a recall-sensitive government bot, fidelity beats the ~0.2 s/answer the lighter quants save. 82 tok/s still streams an answer in ~2–3 s. (Q5/Q4 stay on the Volume for A/B.)
+- **Chosen: `Q4_K_M`** (speed priority) — fastest at ~101 tok/s, byte-identical to Q8 on common facts with only a small drift on rare ones (acceptable for this use). For **max verbatim fidelity**, `Q8_0` (82 tok/s) is a 1-line swap; all quants stay on the Volume.
 
 ### 2. Concurrency: the regime flips the winner
 
@@ -124,7 +124,62 @@ Built-in test/benchmark functions:
 
 ### How it works
 - **`build_gguf`** (A100): downloads the public base + LoRA, merges on GPU, converts to GGUF, k-quantizes, saves to a Modal **Volume** (persists across runs). The trained tokenizer/chat-template + `system_prompt.txt` are carried so prompts render exactly as in training.
-- **`Server`** (`@app.cls`, scale-to-zero): on cold start launches `llama-server` on localhost (`--flash-attn on`, full GPU offload), then a FastAPI app serves the chat page at `/` and proxies `/chat` (injecting the system prompt) with SSE streaming. Hardened: input validation, per-IP rate limit, in-flight lock, upstream error handling, llama-server liveness check, prominent NID disclaimer.
+- **`Server`** (`@app.cls`, scale-to-zero): on cold start launches `llama-server` on localhost (`--flash-attn on`, full GPU offload), then a FastAPI app serves the chat page at `/` and proxies `/chat` (injecting the system prompt) with SSE streaming. Hardened: input validation, per-IP rate limit, in-flight lock, upstream error handling, llama-server liveness check.
+
+**1. One-time build (`modal run build_gguf`):**
+```
+  Hugging Face (public)
+  ┌─────────────────────────┐
+  │ Qwen2.5-7B-Instruct (base)
+  │ ec-SFT-...-lora (adapter)│
+  └───────────┬─────────────┘
+              │ download + merge_and_unload (A100, bf16)
+              ▼
+   convert_hf_to_gguf → llama-quantize (Q4_K_M)
+              │
+              ▼
+   ┌───────────────────────────┐
+   │  Modal Volume (persists)   │
+   │  ec-...Q4_K_M.gguf (~4.7GB) │
+   │  + system_prompt.txt        │
+   └───────────────────────────┘
+```
+
+**2. Runtime (every chat message):**
+```
+  browser ──HTTPS──▶  Modal web endpoint (https://…modal.run)
+   (chat page)              │
+                            ▼   one A100 container (@app.cls)
+                 ┌────────────────────────────┐
+                 │  FastAPI  /chat            │
+                 │  • prepend system prompt    │
+                 │  • trim history to 8k       │
+                 │  • per-IP rate limit        │
+                 └────────────┬───────────────┘
+                              │ localhost:8080 (OpenAI API)
+                              ▼
+                 ┌────────────────────────────┐
+                 │  llama-server (llama.cpp)   │
+                 │  Q4_K_M on GPU, flash-attn  │  ~101 tok/s
+                 │  greedy (temp 0)            │
+                 └────────────┬───────────────┘
+                              │ SSE token stream
+                              ▼
+                 FastAPI ──stream──▶ browser (Bengali types out live)
+```
+
+**3. Scale-to-zero lifecycle (the cost magic):**
+```
+  idle 120s            request arrives             idle again
+   │                        │                          │
+   ▼                        ▼                          ▼
+ [0 GPUs, $0] ──cold start──▶ [1 A100 warm] ──serves──▶ [0 GPUs, $0]
+   ▲   (~30–60s: load GGUF      (pay per second)          ▲
+   │    + start llama-server)                             │
+   └──────────────────  modal app stop = forced off ──────┘
+```
+
+**In one line:** the adapter is **merged + quantized once** onto a Modal **Volume**; at request time Modal spins up **one A100**, runs **`llama-server`** behind a tiny **FastAPI** page (system prompt + history trim), streams tokens back, then **scales to zero** ($0) when idle. Only the chat page is public; the GPU server stays private on `localhost`.
 
 > CUDA gotcha solved here: Modal builds images **without a GPU**, so compiling llama.cpp with CUDA needs the
 > toolkit's **stub `libcuda`** at link time (the real driver is present at runtime). `torch` is pinned to
