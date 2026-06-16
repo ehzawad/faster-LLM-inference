@@ -20,11 +20,10 @@ APP_NAME = "ec-nid-chat"
 ADAPTER = "ehzawad/ec-SFT-qwen25-7b-lora"   # public LoRA
 BASE = "Qwen/Qwen2.5-7B-Instruct"           # public base
 VOL_DIR = "/models"
-# Decision (final): Q8_0 for MAX FACTUAL FIDELITY. A multi-turn replay showed Q5_K_M / Q4_K_M drift from Q8
-# on a low-margin EC/NID fact (the reissue answer) — for a recall-sensitive gov bot, fidelity > the ~0.2s/answer
-# speed edge of the lighter quants. Q8_0 ≈ 82 tok/s solo (answers still stream in ~2-3 s). Other quants stay on
-# the Volume for A/B. (Concurrency isn't a concern; quant is a 1-line swap.)
-QUANT = "Q8_0"
+# Decision: SPEED is the top priority (small drift accepted). Q4_K_M ≈ 101 tok/s solo — the FASTEST quant
+# (vs Q5 94, Q8 82). It's byte-identical to Q8 on common facts and drifts only on rare ones (acceptable).
+# Q8_0 (verbatim) and Q5_K_M also live on the Volume — a 1-line swap if priorities change.
+QUANT = "Q4_K_M"
 GGUF = f"{VOL_DIR}/ec-qwen25-7b.{QUANT}.gguf"
 LLAMA_PORT = 8080
 
@@ -255,6 +254,36 @@ def ctx_compare(quants: str = "Q8_0,Q5_K_M,Q4_K_M", max_tokens: int = 220):
         "কি কি ডকুমেন্ট লাগে",
         "কতদিন লাগে",
     ]
+
+    # ensure each requested quant exists — rebuild bf16 master + quantize if missing
+    import os
+    bf16 = f"{VOL_DIR}/ec-qwen25-7b.bf16.gguf"
+    want = [x.strip() for x in quants.split(",") if x.strip()]
+    missing = [q for q in want if not Path(f"{VOL_DIR}/ec-qwen25-7b.{q}.gguf").exists()]
+    if missing and not Path(bf16).exists():
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import PeftModel
+        merged = "/tmp/merged"
+        print("building bf16 master (one-time) for quantizing ...")
+        base = AutoModelForCausalLM.from_pretrained(
+            BASE, torch_dtype=torch.bfloat16, device_map={"": 0}, low_cpu_mem_usage=True)
+        m = PeftModel.from_pretrained(base, ADAPTER).merge_and_unload()
+        m.save_pretrained(merged, safe_serialization=True, max_shard_size="5GB")
+        AutoTokenizer.from_pretrained(ADAPTER).save_pretrained(merged)
+        del base, m
+        subprocess.run(["python", "/llama.cpp/convert_hf_to_gguf.py", merged,
+                        "--outtype", "bf16", "--outfile", bf16], check=True)
+        subprocess.run(["rm", "-rf", merged])
+        models.commit()
+    for q in missing:
+        g = f"{VOL_DIR}/ec-qwen25-7b.{q}.gguf"
+        print(f"quantizing -> {q} ...")
+        tmp = g + ".tmp"
+        subprocess.run([QUANTIZE_BIN, bf16, tmp, q, str(os.cpu_count() or 4)], check=True)
+        os.replace(tmp, g)
+        models.commit()
+
     out = {}
     for q in [x.strip() for x in quants.split(",") if x.strip()]:
         g = f"{VOL_DIR}/ec-qwen25-7b.{q}.gguf"
@@ -268,34 +297,56 @@ def ctx_compare(quants: str = "Q8_0,Q5_K_M,Q4_K_M", max_tokens: int = 220):
             print(f"[{q}] llama-server failed: {e}")
             continue
 
+        import json as _json
         history = []
+        speeds = []
 
         async def ask(user):
             msgs = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user}]
-            payload = {"model": "ec", "stream": False, "temperature": 0.0, "top_p": 1.0,
+            payload = {"model": "ec", "stream": True, "temperature": 0.0, "top_p": 1.0,
                        "max_tokens": max_tokens, "messages": msgs}
+            t0 = time.perf_counter(); ttft = None; n = 0; chunks = []
             async with httpx.AsyncClient(timeout=300) as c:
-                r = await c.post(f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions", json=payload)
-            return r.json()["choices"][0]["message"]["content"].strip()
+                async with c.stream("POST", f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions", json=payload) as r:
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        d = line[5:].strip()
+                        if d == "[DONE]":
+                            continue
+                        try:
+                            cc = _json.loads(d)["choices"][0]["delta"].get("content")
+                            if cc:
+                                if ttft is None:
+                                    ttft = time.perf_counter() - t0
+                                n += 1; chunks.append(cc)
+                        except Exception:
+                            pass
+            dt = time.perf_counter() - t0
+            dec = (n - 1) / (dt - ttft) if (n > 1 and ttft and dt > ttft) else 0.0
+            if dec:
+                speeds.append(dec)
+            return "".join(chunks).strip()
 
         answers = []
         for u in USER_TURNS:
             a = asyncio.run(ask(u))
             history += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
             answers.append(a)
-        out[q] = answers
+        out[q] = {"answers": answers, "tok_s": round(sum(speeds) / len(speeds), 1) if speeds else 0.0}
         try: proc.terminate()
         except Exception: pass
         time.sleep(3)
 
-    print("\n========= MULTI-TURN CONTEXT TEST (same convo, greedy temp 0) =========")
+    print("\n========= MULTI-TURN: VERBATIM + SPEED across quants (greedy temp 0) =========")
+    print("SPEED: " + "  |  ".join(f"{q}={out[q]['tok_s']} tok/s" for q in out))
     for i, u in enumerate(USER_TURNS):
         print(f"\nUSER: {u}")
         for q in out:
-            print(f"  [{q}] {out[q][i]}")
-    print("\n(If all quants agree per turn -> differences are CONTEXT, not precision.)")
-    print("======================================================================\n")
-    return out
+            print(f"  [{q}] {out[q]['answers'][i]}")
+    print("\n(Per turn: does Q6_K match Q8_0 VERBATIM? If yes -> Q6 = fidelity + more speed.)")
+    print("=============================================================================\n")
+    return {q: out[q]["tok_s"] for q in out}
 
 
 # ---------------- QUANT COMPARE: quality (answers) + solo speed across quants ----------------
@@ -615,8 +666,6 @@ CHAT_HTML = """<!doctype html><html lang="bn"><head><meta charset="utf-8">
 <style>
  body{font-family:system-ui,'Noto Sans Bengali',sans-serif;max-width:760px;margin:0 auto;padding:16px;background:#0b0f14;color:#e6edf3}
  h2{font-weight:600;margin:.2em 0}
- .banner{background:#3a2d00;border:1px solid #6b5200;color:#f0e6c8;border-radius:8px;padding:10px 12px;font-size:14px;margin:8px 0}
- .banner a{color:#ffd966}
  #log{min-height:48vh;border:1px solid #222;border-radius:10px;padding:12px;overflow-y:auto;white-space:pre-wrap}
  .u{color:#7ee787;margin-top:10px} .b{color:#cdd9e5;margin:4px 0 10px} .err{color:#ff7b72}
  #row{display:flex;gap:8px;margin-top:10px}
@@ -625,9 +674,6 @@ CHAT_HTML = """<!doctype html><html lang="bn"><head><meta charset="utf-8">
  button:disabled{background:#30363d;cursor:not-allowed}
 </style></head><body>
 <h2>EC/NID সহায়ক · Qwen2.5-7B</h2>
-<div class="banner">⚠️ এটি সাধারণ সহায়তা মাত্র, সরকারি সিদ্ধান্ত নয়। ফি, সময়সীমা ও নথির জন্য
-<a href="https://services.nidw.gov.bd" target="_blank" rel="noopener">services.nidw.gov.bd</a> বা হেল্পলাইন <b>১০৫ (105)</b> যাচাই করুন।
-NID নম্বর, OTP বা সংবেদনশীল তথ্য শেয়ার করবেন না।</div>
 <div id="log"></div>
 <div id="row"><input id="q" placeholder="আপনার প্রশ্ন লিখুন..." autofocus><button id="btn" onclick="send()">পাঠান</button></div>
 <script>
@@ -639,7 +685,7 @@ async function send(){
   if(busy) return;
   const text=q.value.trim(); if(!text) return; q.value='';
   setBusy(true);
-  add('u','আপনি: '+text);
+  add('u','User: '+text);
   const bot=add('b','...'); let acc='', errored=false;
   history.push({role:'user',content:text});
   try{
